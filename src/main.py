@@ -481,4 +481,4 @@ def main(
 
 if __name__ == "__main__":
     # Set max_videos=None to run the entire dataset
-    main(config="full", max_videos=10, max_frames=None)
+    main(config="full", max_videos=10, max_frames=16)
