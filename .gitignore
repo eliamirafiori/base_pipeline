@@ -1,1 +1,4 @@
-./src/assets/*
+src/__pycache__/*
+src/assets/*
+
+vsi_videos/*
