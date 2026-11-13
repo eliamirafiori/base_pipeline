@@ -1,21 +1,20 @@
-import math
-import re
-import zipfile
-import cv2
-import numpy as np
-import pandas as pd
-import torch
-import json
-import shutil
-
-from pathlib import Path
-from typing import Any, Dict, Generator, List, Set, Optional, Tuple
-from PIL import Image, ImageDraw
 from collections import defaultdict
-from huggingface_hub import HfFileSystem, hf_hub_download
+import math
+from pathlib import Path
+import re
+import shutil
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple
+import zipfile
+
+import cv2
+from datasets import load_dataset
+from huggingface_hub import hf_hub_download
+import numpy as np
+from PIL import Image, ImageDraw
+import torch
 from transformers import BlipForQuestionAnswering, BlipProcessor
 
-# Swap or import your custom KFS classes here
+# Import your swappable KFS methods
 from cascade import EgoMotionAndCascadeKFS
 from methods import (
     ColorHistogramMethod,
@@ -30,45 +29,39 @@ from methods import (
 # =====================================================================
 # 1. LOAD VSI-BENCH DATASET
 # =====================================================================
-def load_vsi_bench(config: str = "debiased") -> List[Dict[str, Any]]:
+def load_vsi_bench(config: str = "full", split: str = "test") -> List[Dict[str, Any]]:
     """
-    Loads VSI-Bench annotations from nyu-visionx/VSI-Bench.
-    Supported configs:
-      - 'debiased' (or 'unbiased') -> loads test_debiased.parquet
-      - 'pruned'                    -> loads test_pruned.parquet
-      - 'full'                      -> loads test.jsonl
+    Loads VSI-Bench annotations using Hugging Face `load_dataset`.
+
+    Args:
+        config: 'full', 'debiased' (or 'unbiased'), or 'pruned'.
+        split:  Dataset split ('test').
     """
     repo_id = "nyu-visionx/VSI-Bench"
-    config_map = {
+    config_files = {
         "debiased": "test_debiased.parquet",
         "unbiased": "test_debiased.parquet",
         "pruned": "test_pruned.parquet",
         "full": "test.jsonl",
     }
 
-    if config not in config_map:
+    if config not in config_files:
         raise ValueError(
-            f"Unknown config '{config}'. Choose from: {list(config_map.keys())}"
+            f"Unknown config '{config}'. Choose from: {list(config_files.keys())}"
         )
 
-    filename = config_map[config]
-    local_path = hf_hub_download(
+    filename = config_files[config]
+    local_file = hf_hub_download(
         repo_id=repo_id, repo_type="dataset", filename=filename
     )
 
-    if filename.endswith(".parquet"):
-        df = pd.read_parquet(local_path)
-        raw_rows = df.to_dict(orient="records")
-    else:
-        with open(local_path, "r", encoding="utf-8") as f:
-            raw_rows = [json.loads(line) for line in f if line.strip()]
+    # Load via 'parquet' or 'json' builder so datasets==3.1.0 infers the schema natively
+    builder = "parquet" if filename.endswith(".parquet") else "json"
+    dataset = load_dataset(builder, data_files={split: local_file}, split=split)
 
-    records = []
-    for row in raw_rows:
-        opts = row.get("options")
-        if hasattr(opts, "tolist"):
-            opts = opts.tolist()
-
+    records: List[Dict[str, Any]] = []
+    for row in dataset:
+        options = row.get("options")
         records.append(
             {
                 "id": int(row["id"]),
@@ -76,10 +69,11 @@ def load_vsi_bench(config: str = "debiased") -> List[Dict[str, Any]]:
                 "scene_name": str(row["scene_name"]),
                 "question_type": str(row.get("question_type", "unknown")),
                 "question": str(row["question"]),
-                "options": opts if opts else None,
+                "options": list(options) if options else None,
                 "ground_truth": str(row["ground_truth"]).strip(),
             }
         )
+
     return records
 
 
@@ -90,45 +84,52 @@ def perform_kfs(
     video_path: str,
     kfs_method: Any,
     max_frames: Optional[int] = 16,
-    resize_dim: Tuple[int, int] = (384, 288),
+    frame_size: Tuple[int, int] = (384, 288),
 ) -> List[Dict[str, Any]]:
     """
-    Runs any swappable `kfs_method` on `video_path`.
-    Returns a chronologically ordered list of dicts:
+    Extracts keyframes from a video using any swappable `kfs_method`.
+
+    Returns:
+        A chronologically ordered list of dictionaries:
         [{"frame": PIL.Image, "timestamp": float}, ...]
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise FileNotFoundError(f"Cannot open video: {video_path}")
+        raise FileNotFoundError(f"Cannot open video file: {video_path}")
 
+    # Fall back to 30 FPS if the video container lacks FPS metadata
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
     sampled_video: List[Dict[str, Any]] = []
     frame_idx = 0
 
     while True:
         ret, frame_bgr = cap.read()
         if not ret:
-            break
+            break  # End of video reached
 
-        # Frame 0 always initializes the reference state in your KFSMethod classes
         if frame_idx == 0:
+            # Frame 0 always initializes the reference state and is kept as the first keyframe
             kfs_method.set_reference(frame_bgr)
             is_keyframe = True
         else:
-            _, is_keyframe, feat_curr = kfs_method.evaluate_frame(frame_bgr)
+            # Compare current frame against the last keyframe reference
+            _, is_keyframe, current_features = kfs_method.evaluate_frame(frame_bgr)
+
+            # When a scene change is detected, promote this frame to be the new reference
             if is_keyframe:
-                kfs_method.set_reference(frame_bgr, feat_curr)
+                kfs_method.set_reference(frame_bgr, current_features)
 
         if is_keyframe:
-            timestamp_sec = round(frame_idx / fps, 2)
+            # Downscale early to save RAM, convert OpenCV BGR -> PIL RGB, and store timestamp
             resized_bgr = cv2.resize(
-                frame_bgr, resize_dim, interpolation=cv2.INTER_AREA
+                frame_bgr, frame_size, interpolation=cv2.INTER_AREA
             )
             frame_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
             sampled_video.append(
                 {
                     "frame": Image.fromarray(frame_rgb),
-                    "timestamp": timestamp_sec,
+                    "timestamp": round(frame_idx / fps, 2),
                 }
             )
 
@@ -136,13 +137,11 @@ def perform_kfs(
 
     cap.release()
 
-    # Enforce frame budget while preserving chronological order
+    # If the KFS method triggered more frames than `max_frames`, evenly subsample
+    # across the selected keyframes while preserving strict chronological order
     if max_frames is not None and len(sampled_video) > max_frames:
-        keep_indices = [
-            int(round(i * (len(sampled_video) - 1) / (max_frames - 1)))
-            for i in range(max_frames)
-        ]
-        sampled_video = [sampled_video[i] for i in keep_indices]
+        even_indices = np.linspace(0, len(sampled_video) - 1, max_frames, dtype=int)
+        sampled_video = [sampled_video[i] for i in even_indices]
 
     return sampled_video
 
@@ -152,37 +151,58 @@ def perform_kfs(
 # =====================================================================
 def load_small_vlm(model_id: str = "Salesforce/blip-vqa-base") -> Dict[str, Any]:
     """
-    Loads a lightweight VLM compatible with torch==1.13.1 and GTX 980 Ti (6GB VRAM).
+    Loads Salesforce/blip-vqa-base (~385M params) onto GPU in FP16 (~1.1 GB VRAM),
+    making it fast and safe for a 6 GB GTX 980 Ti.
     """
+    # Use CUDA on the GTX 980 Ti if available, otherwise fall back to Ryzen CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # FP16 halves VRAM usage and speeds up inference on GPU; CPU requires FP32
     dtype = torch.float16 if device == "cuda" else torch.float32
 
+    # BlipProcessor handles image resizing/normalization and text tokenization
     processor = BlipProcessor.from_pretrained(model_id)
+
+    # Load model weights in the target precision and move them to the GPU
     model = BlipForQuestionAnswering.from_pretrained(model_id, torch_dtype=dtype).to(
         device
     )
+
+    # Set to evaluation mode (disables dropout and gradient tracking overhead)
     model.eval()
 
-    return {"model": model, "processor": processor, "device": device, "dtype": dtype}
+    return {
+        "model": model,
+        "processor": processor,
+        "device": device,
+        "dtype": dtype,
+    }
 
 
 def _pack_frames_with_timestamps(
-    sampled_video: List[Dict[str, Any]], tile_size: Tuple[int, int] = (224, 168)
+    sampled_video: List[Dict[str, Any]],
+    tile_size: Tuple[int, int] = (224, 168),
 ) -> Image.Image:
-    """Stitches {frame, timestamp} items into a chronological contact sheet for the VLM."""
-    n = max(1, len(sampled_video))
-    cols = math.ceil(math.sqrt(n))
-    rows = math.ceil(n / cols)
-    tw, th = tile_size
+    """
+    Arranges chronological {frame, timestamp} pairs into a single contact sheet
+    with burned-in timestamps so a single-image VLM can reason across time.
+    """
+    num_frames = max(1, len(sampled_video))
+    cols = math.ceil(math.sqrt(num_frames))
+    rows = math.ceil(num_frames / cols)
+    tile_w, tile_h = tile_size
 
-    grid = Image.new("RGB", (cols * tw, rows * th), color=(0, 0, 0))
+    grid = Image.new("RGB", (cols * tile_w, rows * tile_h), color=(0, 0, 0))
     draw = ImageDraw.Draw(grid)
 
     for idx, item in enumerate(sampled_video):
-        r, c = divmod(idx, cols)
-        x0, y0 = c * tw, r * th
-        tile = item["frame"].resize((tw, th), Image.Resampling.BILINEAR)
+        row, col = divmod(idx, cols)
+        x0, y0 = col * tile_w, row * tile_h
+
+        tile = item["frame"].resize((tile_w, tile_h), Image.Resampling.BILINEAR)
         grid.paste(tile, (x0, y0))
+
+        # Draw a small dark badge in the top-left corner of each tile with its timestamp
         draw.rectangle([x0, y0, x0 + 85, y0 + 16], fill=(0, 0, 0))
         draw.text((x0 + 4, y0 + 2), f"t={item['timestamp']}s", fill=(255, 255, 0))
 
@@ -197,8 +217,7 @@ def ask_vlm(
     options: Optional[List[str]] = None,
 ) -> str:
     """
-    Takes the VLM bundle, the KFS output (`sampled_video`), and the VSI-Bench question,
-    and returns the model's text answer.
+    Passes the KFS contact sheet and VSI-Bench question to BLIP-VQA and returns its answer.
     """
     visual_input = _pack_frames_with_timestamps(sampled_video)
 
@@ -213,241 +232,185 @@ def ask_vlm(
     device = vlm_bundle["device"]
     dtype = vlm_bundle["dtype"]
 
+    # Prepare image & text tensors and cast floating-point image tensors to FP16 on GPU
     inputs = processor(images=visual_input, text=prompt, return_tensors="pt")
     inputs = {
-        k: (v.to(device, dtype=dtype) if v.is_floating_point() else v.to(device))
-        for k, v in inputs.items()
+        key: (
+            val.to(device, dtype=dtype) if val.is_floating_point() else val.to(device)
+        )
+        for key, val in inputs.items()
     }
 
     output_ids = model.generate(**inputs, max_new_tokens=12)
-    answer = processor.decode(output_ids[0], skip_special_tokens=True).strip()
-    return answer
+    return processor.decode(output_ids[0], skip_special_tokens=True).strip()
 
 
 # =====================================================================
 # 4. ACCURACY EVALUATION AGAINST GROUND TRUTH
 # =====================================================================
+def _score_multiple_choice(
+    prediction: str, ground_truth: str, options: List[str]
+) -> float:
+    """
+    Scores multiple-choice questions (returns 1.0 if correct, 0.0 otherwise).
+    Accepts either the option letter (e.g., 'B') or the option's text content.
+    """
+    # 1. Check if the model predicted a standalone option letter (A, B, C, or D)
+    letter_match = re.search(r"\b([a-d])\b", prediction)
+    if letter_match and letter_match.group(1) == ground_truth:
+        return 1.0
+
+    # 2. Otherwise, check if the model wrote out the text of the ground-truth option
+    for option in options:
+        opt_lower = option.lower().strip()
+        is_gt_option = opt_lower.startswith(f"{ground_truth}.") or opt_lower.startswith(
+            f"({ground_truth})"
+        )
+        if is_gt_option:
+            # Strip the leading 'a.' or '(a)' prefix to compare the choice text itself
+            option_body = re.sub(r"^\(?[a-d]\)?\.?\s*", "", opt_lower)
+            if option_body and option_body in prediction:
+                return 1.0
+
+    return 1.0 if prediction == ground_truth else 0.0
+
+
+def _score_numerical_mra(prediction: str, ground_truth: str) -> float:
+    """
+    Scores numerical questions using VSI-Bench's Mean Relative Accuracy (MRA).
+    Measures how close the predicted number is to the ground truth across 10
+    tolerance levels (from 50% relative error down to 5% relative error).
+    """
+    pred_match = re.search(r"[-+]?\d*\.?\d+", prediction)
+    gt_match = re.search(r"[-+]?\d*\.?\d+", ground_truth)
+
+    if not pred_match or not gt_match:
+        return 1.0 if prediction == ground_truth else 0.0
+
+    pred_val = float(pred_match.group(0))
+    gt_val = float(gt_match.group(0))
+
+    if gt_val == 0.0:
+        return 1.0 if pred_val == 0.0 else 0.0
+
+    relative_error = abs(pred_val - gt_val) / abs(gt_val)
+
+    # Thresholds [0.50, 0.55, ..., 0.95] correspond to max allowed errors [50%, 45%, ..., 5%]
+    thresholds = np.linspace(0.50, 0.95, 10)
+    passed = [1.0 if relative_error < (1.0 - t) else 0.0 for t in thresholds]
+    return float(np.mean(passed))
+
+
 def evaluate_accuracy(
     prediction: str,
     ground_truth: str,
     options: Optional[List[str]] = None,
 ) -> float:
     """
-    Compares the VLM answer with the VSI-Bench ground truth.
-    - Multiple-choice questions: returns 1.0 (correct) or 0.0 (incorrect).
-    - Numerical questions: returns official VSI-Bench Mean Relative Accuracy (MRA).
+    Compares the VLM's answer against the VSI-Bench ground truth.
+    Returns a score between 0.0 and 1.0.
     """
     pred_clean = prediction.strip().lower()
     gt_clean = ground_truth.strip().lower()
 
-    # Multiple-choice evaluation
     if options:
-        letter_match = re.search(r"\b([a-d])\b", pred_clean)
-        if letter_match and letter_match.group(1) == gt_clean:
-            return 1.0
-
-        # Also check if the VLM output the text of the correct option directly
-        for opt in options:
-            opt_lower = opt.lower().strip()
-            if opt_lower.startswith(f"{gt_clean}.") or opt_lower.startswith(
-                f"({gt_clean})"
-            ):
-                opt_text = opt_lower.split(".", 1)[-1].strip()
-                if opt_text and opt_text in pred_clean:
-                    return 1.0
-
-        return 1.0 if pred_clean == gt_clean else 0.0
-
-    # Numerical evaluation (Mean Relative Accuracy across thresholds 0.50 -> 0.95)
-    pred_num = re.search(r"[-+]?\d*\.?\d+", pred_clean)
-    gt_num = re.search(r"[-+]?\d*\.?\d+", gt_clean)
-
-    if not pred_num or not gt_num:
-        return 1.0 if pred_clean == gt_clean else 0.0
-
-    p_val = float(pred_num.group(0))
-    g_val = float(gt_num.group(0))
-    if g_val == 0:
-        return 1.0 if p_val == 0 else 0.0
-
-    rel_error = abs(p_val - g_val) / abs(g_val)
-    thresholds = np.linspace(0.50, 0.95, 10)
-    return float(np.mean([1.0 if rel_error < (1.0 - t) else 0.0 for t in thresholds]))
+        return _score_multiple_choice(pred_clean, gt_clean, options)
+    return _score_numerical_mra(pred_clean, gt_clean)
 
 
 # =====================================================================
-# HELPER: FETCH A SINGLE SCENE VIDEO FROM VSI-BENCH ZIP IF NEEDED
+# 5. VIDEO STREAMING FROM HUGGING FACE ARCHIVES
 # =====================================================================
-def get_vsi_video_path(
-    dataset_name: str, scene_name: str, cache_dir: str = "./vsi_videos"
-) -> str:
-    """Extracts a single scene MP4 from the corresponding VSI-Bench zip archive on demand."""
-    out_dir = Path(cache_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    target_mp4 = out_dir / f"{scene_name}.mp4"
-    if target_mp4.exists():
-        return str(target_mp4)
-
-    zip_filename = f"{dataset_name}.zip"
-    local_zip = hf_hub_download(
-        repo_id="nyu-visionx/VSI-Bench",
-        repo_type="dataset",
-        filename=zip_filename,
-        local_dir=str(out_dir),
-    )
-    with zipfile.ZipFile(local_zip, "r") as zf:
-        for member in zf.namelist():
-            if member.endswith(f"{scene_name}.mp4"):
-                with zf.open(member) as src, open(target_mp4, "wb") as dst:
-                    dst.write(src.read())
-                return str(target_mp4)
-
-    raise FileNotFoundError(f"Scene {scene_name}.mp4 not found inside {zip_filename}")
-
-
-# =====================================================================
-# MAIN EXECUTION EXAMPLE
-# =====================================================================
-def main():
-    # 1. Load VSI-Bench questions
-    vsi_questions = load_vsi_bench(split="test")
-    print(f"Loaded {len(vsi_questions)} total VSI-Bench questions.")
-
-    # 2. Load the small VLM once
-    vlm_bundle = load_small_vlm("Salesforce/blip-vqa-base")
-
-    # 3. Define the swappable KFS methods you want to compare
-    kfs_methods = [
-        FourierMethod(threshold=0.28, blur_thresh=15.0),
-        PixelIntensityMethod(threshold=25.0),
-        ColorHistogramMethod(threshold=0.35, grid_size=(2, 2)),
-        LocalDescriptorMethod(threshold=0.70, n_features=500),
-        LucasKanadeOpticalFlowMethod(
-            threshold=45.0, max_corners=250, min_survival_ratio=0.45
-        ),
-        FarnebackOpticalFlowMethod(threshold=25.0, grid_size=(160, 120)),
-        EgoMotionAndCascadeKFS(
-            flow_trigger_thresh=22.0,
-            static_sad_thresh=1.8,
-            blur_thresh=15.0,
-            orb_thresh=0.65,
-        ),
-    ]
-
-    # Pick the first scene in VSI-Bench (or point directly to a local .mp4)
-    first_scene = vsi_questions[0]["scene_name"]
-    first_dataset = vsi_questions[0]["dataset"]
-    scene_questions = [q for q in vsi_questions if q["scene_name"] == first_scene]
-
-    video_path = get_vsi_video_path(first_dataset, first_scene)
-    print(f"\nEvaluating scene '{first_scene}' ({len(scene_questions)} questions)...")
-
-    # 4. Run each swappable KFS method and compare VLM accuracy
-    for method in kfs_methods:
-        sampled_video = perform_kfs(
-            video_path=video_path, kfs_method=method, max_frames=None
-        )
-
-        scores = []
-        for q in scene_questions:
-            vlm_answer = ask_vlm(
-                vlm_bundle=vlm_bundle,
-                sampled_video=sampled_video,
-                question=q["question"],
-                options=q["options"],
-            )
-            acc = evaluate_accuracy(
-                prediction=vlm_answer,
-                ground_truth=q["ground_truth"],
-                options=q["options"],
-            )
-            scores.append(acc)
-
-        mean_acc = float(np.mean(scores)) * 100.0 if scores else 0.0
-        print(
-            f"Method: {method.name:<32} | "
-            f"Sampled Frames: {len(sampled_video):>2} | "
-            f"Scene Accuracy: {mean_acc:>5.1f}%"
-        )
-
-
-def iter_all_vsi_videos(
+def iter_vsi_videos(
+    target_scenes: Optional[Set[str]] = None,
     cache_dir: str = "./vsi_videos",
-    archives: Tuple[str, ...] = ("arkitscenes.zip", "scannet.zip", "scannetpp.zip"),
     cleanup: bool = True,
 ) -> Generator[Tuple[str, str], None, None]:
     """
-    Downloads and extracts one VSI-Bench zip archive at a time, yields
-    (scene_name, mp4_path) for every video inside, and deletes temporary files
-    afterward (even if the caller breaks early).
+    Streams VSI-Bench videos one dataset archive at a time (`arkitscenes.zip`,
+    `scannet.zip`, `scannetpp.zip`), yielding `(scene_name, local_mp4_path)`.
+
+    If `target_scenes` is provided, only matching videos are extracted and
+    remaining scenes are skipped once all targets have been yielded.
     """
-    base = Path(cache_dir)
-    base.mkdir(parents=True, exist_ok=True)
+    repo_id = "nyu-visionx/VSI-Bench"
+    archives = ("arkitscenes.zip", "scannet.zip", "scannetpp.zip")
+    remaining = set(target_scenes) if target_scenes is not None else None
+
+    base_dir = Path(cache_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
 
     for zip_name in archives:
-        print(f"\n[Disk Manager] Fetching {zip_name} from nyu-visionx/VSI-Bench...")
+        # Stop downloading further archives if all target scenes were already found
+        if remaining is not None and len(remaining) == 0:
+            break
+
+        print(f"\n[Storage] Downloading {zip_name}...")
         local_zip = hf_hub_download(
-            repo_id="nyu-visionx/VSI-Bench",
+            repo_id=repo_id,
             repo_type="dataset",
             filename=zip_name,
-            local_dir=str(base / "zips"),
+            local_dir=str(base_dir / "zips"),
         )
 
-        extract_dir = base / Path(zip_name).stem
+        extract_dir = base_dir / Path(zip_name).stem
         extract_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             with zipfile.ZipFile(local_zip, "r") as zf:
-                zf.extractall(extract_dir)
+                for member in sorted(zf.namelist()):
+                    if not member.endswith(".mp4"):
+                        continue
 
-            for mp4_path in sorted(extract_dir.rglob("*.mp4")):
-                yield mp4_path.stem, str(mp4_path)
+                    scene_name = Path(member).stem
+                    if remaining is not None and scene_name not in remaining:
+                        continue
+
+                    extracted_path = zf.extract(member, path=extract_dir)
+                    if remaining is not None:
+                        remaining.remove(scene_name)
+
+                    yield scene_name, extracted_path
         finally:
+            # Always delete extracted MP4s and the zip archive after finishing this batch
             if cleanup:
-                print(f"[Disk Manager] Cleaning up {zip_name} to free disk space...")
+                print(f"[Storage] Removing temporary files for {zip_name}...")
                 shutil.rmtree(extract_dir, ignore_errors=True)
                 Path(local_zip).unlink(missing_ok=True)
 
 
-def load_checkpoint(ckpt_path: Path) -> Tuple[Set[Tuple[str, str]], List[dict]]:
-    """Loads previously saved results so interrupted runs resume cleanly."""
-    done_pairs: Set[Tuple[str, str]] = set()
-    records: List[dict] = []
-    if ckpt_path.exists():
-        with ckpt_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    rec = json.loads(line)
-                    records.append(rec)
-                    done_pairs.add((rec["scene_name"], rec["method"]))
-    return done_pairs, records
-
-
-def main_long(max_videos: Optional[int] = 10):
-    ckpt_path = Path("vsi_full_results.jsonl")
-
-    # 1. Load all VSI-Bench QA pairs and group by scene_name
-    vsi_questions = load_vsi_bench(config="full")
-    questions_by_scene: Dict[str, List[dict]] = defaultdict(list)
+# =====================================================================
+# 6. MAIN EVALUATION PIPELINE
+# =====================================================================
+def main(
+    config: str = "full",
+    max_videos: Optional[int] = 10,
+    max_frames: Optional[int] = 16,
+) -> None:
+    """
+    Runs all KFS methods across VSI-Bench videos (up to `max_videos`) and
+    compares their downstream VLM accuracy.
+    """
+    # 1. Load VSI-Bench questions and group them by scene
+    vsi_questions = load_vsi_bench(config=config, split="test")
+    questions_by_scene: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for q in vsi_questions:
         questions_by_scene[q["scene_name"]].append(q)
 
+    # Optionally limit the evaluation to the first N scenes
+    all_scenes = sorted(questions_by_scene.keys())
+    selected_scenes = set(all_scenes[:max_videos] if max_videos else all_scenes)
+    total_q = sum(len(questions_by_scene[s]) for s in selected_scenes)
+
     print(
-        f"Loaded {len(vsi_questions)} questions across "
-        f"{len(questions_by_scene)} unique VSI-Bench scenes."
+        f"Loaded VSI-Bench ({config}): {total_q} questions across "
+        f"{len(selected_scenes)} videos."
     )
 
-    # 2. Resume from checkpoint if present
-    done_pairs, all_records = load_checkpoint(ckpt_path)
-    if done_pairs:
-        print(
-            f"Resuming: {len(done_pairs)} (scene, method) evaluations already completed."
-        )
-
-    # 3. Load the small VLM once on GPU
+    # 2. Load the lightweight VLM once onto GPU
     vlm_bundle = load_small_vlm("Salesforce/blip-vqa-base")
 
-    # 4. Swappable KFS methods to compare
+    # 3. Define the swappable KFS methods to benchmark
     kfs_methods = [
         FourierMethod(threshold=0.28, blur_thresh=15.0),
         PixelIntensityMethod(threshold=25.0),
@@ -465,73 +428,45 @@ def main_long(max_videos: Optional[int] = 10):
         ),
     ]
 
-    # 5. Stream through VSI-Bench up to `max_videos`
-    processed_videos = 0
-    target_total = max_videos if max_videos is not None else len(questions_by_scene)
+    # 4. Evaluate every scene across all KFS methods
+    stats = defaultdict(lambda: {"acc": [], "frames": []})
 
-    with ckpt_path.open("a", encoding="utf-8") as ckpt_f:
-        for scene_name, video_path in iter_all_vsi_videos(cleanup=True):
-            if max_videos is not None and processed_videos >= max_videos:
-                break
+    for vid_idx, (scene_name, video_path) in enumerate(
+        iter_vsi_videos(target_scenes=selected_scenes, cleanup=True), start=1
+    ):
+        scene_questions = questions_by_scene[scene_name]
+        print(
+            f"\n[Video {vid_idx}/{len(selected_scenes)}] "
+            f"Scene '{scene_name}' ({len(scene_questions)} questions)"
+        )
 
-            scene_questions = questions_by_scene.get(scene_name)
-            if not scene_questions:
-                continue
-
-            processed_videos += 1
-            print(
-                f"\n[Video {processed_videos}/{target_total}] Scene '{scene_name}' ({len(scene_questions)} questions)"
+        for method in kfs_methods:
+            # Extract keyframes once per video (independent of the questions)
+            sampled_video = perform_kfs(
+                video_path=video_path,
+                kfs_method=method,
+                max_frames=max_frames,
             )
 
-            for method in kfs_methods:
-                if (scene_name, method.name) in done_pairs:
-                    continue
-
-                # Run KFS once per video (question-independent)
-                sampled_video = perform_kfs(
-                    video_path=video_path,
-                    kfs_method=method,
-                    max_frames=None,
+            # Reuse those exact keyframes across all questions for this scene
+            for q in scene_questions:
+                vlm_answer = ask_vlm(
+                    vlm_bundle=vlm_bundle,
+                    sampled_video=sampled_video,
+                    question=q["question"],
+                    options=q["options"],
                 )
+                acc = evaluate_accuracy(
+                    prediction=vlm_answer,
+                    ground_truth=q["ground_truth"],
+                    options=q["options"],
+                )
+                stats[method.name]["acc"].append(acc)
+                stats[method.name]["frames"].append(len(sampled_video))
 
-                # Reuse those exact keyframes across every question for this scene
-                for q in scene_questions:
-                    vlm_answer = ask_vlm(
-                        vlm_bundle=vlm_bundle,
-                        sampled_video=sampled_video,
-                        question=q["question"],
-                        options=q["options"],
-                    )
-                    acc = evaluate_accuracy(
-                        prediction=vlm_answer,
-                        ground_truth=q["ground_truth"],
-                        options=q["options"],
-                    )
-
-                    rec = {
-                        "scene_name": scene_name,
-                        "question_id": q["id"],
-                        "question_type": q["question_type"],
-                        "method": method.name,
-                        "num_frames": len(sampled_video),
-                        "prediction": vlm_answer,
-                        "ground_truth": q["ground_truth"],
-                        "accuracy": acc,
-                    }
-                    ckpt_f.write(json.dumps(rec) + "\n")
-                    all_records.append(rec)
-
-                ckpt_f.flush()
-                done_pairs.add((scene_name, method.name))
-
-    # 6. Print overall accuracy across evaluated videos
-    stats = defaultdict(lambda: {"acc": [], "frames": []})
-    for r in all_records:
-        stats[r["method"]]["acc"].append(r["accuracy"])
-        stats[r["method"]]["frames"].append(r["num_frames"])
-
+    # 5. Print final comparison table
     print("\n" + "=" * 72)
-    print(f"VSI-BENCH EVALUATION SUMMARY ({processed_videos} VIDEOS)")
+    print(f"VSI-BENCH ({config.upper()}) SUMMARY — {len(selected_scenes)} VIDEOS")
     print("=" * 72)
     for method in kfs_methods:
         s = stats[method.name]
@@ -545,4 +480,5 @@ def main_long(max_videos: Optional[int] = 10):
 
 
 if __name__ == "__main__":
-    main_long(max_videos=10)  # Set to None to run all videos
+    # Set max_videos=None to run the entire dataset
+    main(config="full", max_videos=10, max_frames=None)
