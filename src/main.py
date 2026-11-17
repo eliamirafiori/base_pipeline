@@ -20,6 +20,7 @@ from transformers import (
     CLIPProcessor,
 )
 
+# Import your swappable KFS classes (no __init__.py required)
 from base import UniformSamplingMethod
 from cascade import EgoMotionAndCascadeKFS
 from methods import (
@@ -198,43 +199,65 @@ def load_clip_filter(model_id: str = "openai/clip-vit-base-patch32") -> Dict[str
 
 
 @torch.no_grad()
-def select_top_k_for_question(
+def encode_keyframes_clip(
     clip_bundle: Dict[str, Any],
     sampled_video: List[Dict[str, Any]],
-    question: str,
-    top_k: int = 4,
-) -> List[Dict[str, Any]]:
+    batch_size: int = 32,
+) -> torch.Tensor:
     """
-    Picks the `top_k` most question-relevant frames from the KFS output pool
-    using CLIP text-image similarity, then re-sorts them chronologically.
-    Keeping `top_k=4` ensures BLIP-VQA always sees a crisp 2x2 grid.
+    Encodes all KFS-selected frames into L2-normalized CLIP embeddings in small
+    mini-batches (`batch_size=32`) so VRAM stays flat even when `max_kfs_frames=None`
+    produces hundreds of keyframes. Computed ONCE per video, not per question.
     """
-    if len(sampled_video) <= top_k:
-        return sampled_video
-
-    images = [item["frame"] for item in sampled_video]
     processor = clip_bundle["processor"]
     model = clip_bundle["model"]
     device = clip_bundle["device"]
     dtype = clip_bundle["dtype"]
 
-    inputs = processor(
-        text=[question],
-        images=images,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-    inputs = {
-        key: (
-            val.to(device, dtype=dtype) if val.is_floating_point() else val.to(device)
-        )
-        for key, val in inputs.items()
-    }
+    all_embeds: List[torch.Tensor] = []
+    for start in range(0, len(sampled_video), batch_size):
+        batch_images = [
+            item["frame"] for item in sampled_video[start : start + batch_size]
+        ]
+        inputs = processor(images=batch_images, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device, dtype=dtype)
 
-    # Compute similarity between the question and every selected keyframe
-    logits_per_image = model(**inputs).logits_per_image.squeeze(-1)
-    top_indices = torch.topk(logits_per_image, k=top_k).indices.cpu().tolist()
+        img_embeds = model.get_image_features(pixel_values=pixel_values)
+        img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
+        all_embeds.append(img_embeds)
+
+    return torch.cat(all_embeds, dim=0)
+
+
+@torch.no_grad()
+def select_top_k_for_question(
+    clip_bundle: Dict[str, Any],
+    sampled_video: List[Dict[str, Any]],
+    image_embeds: torch.Tensor,
+    question: str,
+    top_k: int = 4,
+) -> List[Dict[str, Any]]:
+    """
+    Picks the `top_k` most question-relevant frames using precomputed CLIP image
+    embeddings, then re-sorts them chronologically.
+    Keeping `top_k=4` ensures BLIP-VQA always sees a crisp 2x2 grid.
+    """
+    if len(sampled_video) <= top_k:
+        return sampled_video
+
+    processor = clip_bundle["processor"]
+    model = clip_bundle["model"]
+    device = clip_bundle["device"]
+
+    text_inputs = processor(
+        text=[question], return_tensors="pt", padding=True, truncation=True
+    ).to(device)
+    text_embeds = model.get_text_features(**text_inputs)
+    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+
+    # Cosine similarity between the question and every pre-encoded keyframe
+    scores = (image_embeds @ text_embeds.T).squeeze(-1)
+    top_indices = torch.topk(scores, k=top_k).indices.cpu().tolist()
 
     # Re-sort chronologically so temporal order is preserved for the VLM
     return [sampled_video[i] for i in sorted(top_indices)]
@@ -479,11 +502,12 @@ def main(
     max_videos: Optional[int] = 10,
     max_kfs_frames: Optional[int] = None,
     vlm_top_k: int = 4,
+    clip_batch_size: int = 32,
 ) -> None:
     """
     Evaluates all swappable KFS methods on VSI-Bench (up to `max_videos`) using:
       Stage 1: Question-agnostic KFS extraction + intrinsic quality metrics
-      Stage 2: CLIP Top-K question-relevant frame retrieval + BLIP-VQA scoring
+      Stage 2: Mini-batched CLIP embedding + Top-K retrieval + BLIP-VQA scoring
     """
     # 1. Load VSI-Bench questions and group them by scene
     vsi_questions = load_vsi_bench(config=config, split="test")
@@ -508,17 +532,17 @@ def main(
     # 3. Define the swappable KFS methods to benchmark (including Uniform baseline)
     kfs_methods = [
         UniformSamplingMethod(step=30),
-        FourierMethod(threshold=0.28, blur_thresh=15.0),
-        PixelIntensityMethod(threshold=25.0),
+        FourierMethod(threshold=0.65, blur_thresh=15.0),
+        PixelIntensityMethod(threshold=45.0),
         ColorHistogramMethod(threshold=0.35, grid_size=(2, 2)),
         LocalDescriptorMethod(threshold=0.70, n_features=500),
         LucasKanadeOpticalFlowMethod(
-            threshold=45.0, max_corners=250, min_survival_ratio=0.45
+            threshold=85.0, max_corners=250, min_survival_ratio=0.45
         ),
         FarnebackOpticalFlowMethod(threshold=25.0, grid_size=(160, 120)),
         EgoMotionAndCascadeKFS(
-            flow_trigger_thresh=22.0,
-            static_sad_thresh=1.8,
+            flow_trigger_thresh=25.0,
+            static_sad_thresh=3.5,
             blur_thresh=15.0,
             orb_thresh=0.65,
         ),
@@ -559,11 +583,19 @@ def main(
             stats[method.name]["avg_sharpness"].append(kfs_metrics["avg_sharpness"])
             stats[method.name]["latency_ms"].append(kfs_metrics["latency_ms_per_frame"])
 
+            # Pre-encode keyframes in mini-batches of 32 (prevents OOM when max_kfs_frames=None)
+            image_embeds = encode_keyframes_clip(
+                clip_bundle=clip_bundle,
+                sampled_video=sampled_video,
+                batch_size=clip_batch_size,
+            )
+
             # Stage 2: Retrieve top-K frames per question via CLIP and query BLIP-VQA
             for q in scene_questions:
                 top_frames = select_top_k_for_question(
                     clip_bundle=clip_bundle,
                     sampled_video=sampled_video,
+                    image_embeds=image_embeds,
                     question=q["question"],
                     top_k=vlm_top_k,
                 )
@@ -579,6 +611,11 @@ def main(
                     options=q["options"],
                 )
                 stats[method.name]["acc"].append(acc)
+
+            # Free per-video CLIP embedding tensor before moving to the next KFS method
+            del image_embeds
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # 5. Print comprehensive comparison table (Intrinsic KFS + Downstream VLM)
     print("\n" + "=" * 108)
@@ -612,5 +649,5 @@ def main(
 
 
 if __name__ == "__main__":
-    # Set max_videos=None to evaluate the entire VSI-Bench dataset
-    main(config="debiased", max_videos=1, max_kfs_frames=None, vlm_top_k=4)
+    # Safe to run with max_kfs_frames=None on GTX 980 Ti (6 GB VRAM)
+    main(config="debiased", max_videos=None, max_kfs_frames=None, vlm_top_k=4)
