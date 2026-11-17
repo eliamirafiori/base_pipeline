@@ -2,6 +2,10 @@
 
 In this work I'm trying to implement the basic pipeline in order to see how different KFS methods influence the responses of a VLM.
 
+conda activate base_pipeline
+
+python src/main.py
+
 ## ENVIRONMENT
 
 I'm using Python 3.10, with a Virtual Environment.

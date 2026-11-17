@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 import zipfile
 
@@ -12,9 +13,14 @@ from huggingface_hub import hf_hub_download
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
-from transformers import BlipForQuestionAnswering, BlipProcessor
+from transformers import (
+    BlipForQuestionAnswering,
+    BlipProcessor,
+    CLIPModel,
+    CLIPProcessor,
+)
 
-# Import your swappable KFS methods
+from base import UniformSamplingMethod
 from cascade import EgoMotionAndCascadeKFS
 from methods import (
     ColorHistogramMethod,
@@ -29,13 +35,15 @@ from methods import (
 # =====================================================================
 # 1. LOAD VSI-BENCH DATASET
 # =====================================================================
-def load_vsi_bench(config: str = "full", split: str = "test") -> List[Dict[str, Any]]:
+def load_vsi_bench(
+    config: str = "debiased", split: str = "test"
+) -> List[Dict[str, Any]]:
     """
     Loads VSI-Bench annotations using Hugging Face `load_dataset`.
 
     Args:
         config: 'full', 'debiased' (or 'unbiased'), or 'pruned'.
-        split:  Dataset split ('test').
+        split:  Dataset split (VSI-Bench uses 'test').
     """
     repo_id = "nyu-visionx/VSI-Bench"
     config_files = {
@@ -55,7 +63,7 @@ def load_vsi_bench(config: str = "full", split: str = "test") -> List[Dict[str, 
         repo_id=repo_id, repo_type="dataset", filename=filename
     )
 
-    # Load via 'parquet' or 'json' builder so datasets==3.1.0 infers the schema natively
+    # Load via 'parquet' or 'json' builder so datasets==3.1.0 infers the schema cleanly
     builder = "parquet" if filename.endswith(".parquet") else "json"
     dataset = load_dataset(builder, data_files={split: local_file}, split=split)
 
@@ -78,30 +86,35 @@ def load_vsi_bench(config: str = "full", split: str = "test") -> List[Dict[str, 
 
 
 # =====================================================================
-# 2. KEYFRAME SELECTION (SWAPPABLE KFS METHOD)
+# 2. KEYFRAME SELECTION (SWAPPABLE KFS METHOD + INTRINSIC METRICS)
 # =====================================================================
 def perform_kfs(
     video_path: str,
     kfs_method: Any,
-    max_frames: Optional[int] = 16,
+    max_frames: Optional[int] = None,
     frame_size: Tuple[int, int] = (384, 288),
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
     """
-    Extracts keyframes from a video using any swappable `kfs_method`.
+    Runs any swappable `kfs_method` on `video_path` without seeing the question.
 
     Returns:
-        A chronologically ordered list of dictionaries:
-        [{"frame": PIL.Image, "timestamp": float}, ...]
+        sampled_video: Chronologically ordered list of dicts:
+                       [{"frame": PIL.Image, "timestamp": float}, ...]
+        metrics:       Intrinsic KFS quality stats (total_frames, selected_frames,
+                       compression_ratio, avg_sharpness, latency_ms_per_frame).
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video file: {video_path}")
 
-    # Fall back to 30 FPS if the video container lacks FPS metadata
+    # Fall back to 30 FPS if the container lacks FPS metadata
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
     sampled_video: List[Dict[str, Any]] = []
+    sharpness_scores: List[float] = []
     frame_idx = 0
+
+    t_start = time.perf_counter()
 
     while True:
         ret, frame_bgr = cap.read()
@@ -109,19 +122,23 @@ def perform_kfs(
             break  # End of video reached
 
         if frame_idx == 0:
-            # Frame 0 always initializes the reference state and is kept as the first keyframe
+            # Frame 0 always initializes the reference state and becomes the first keyframe
             kfs_method.set_reference(frame_bgr)
             is_keyframe = True
         else:
-            # Compare current frame against the last keyframe reference
+            # Score current frame against the active reference keyframe
             _, is_keyframe, current_features = kfs_method.evaluate_frame(frame_bgr)
 
-            # When a scene change is detected, promote this frame to be the new reference
+            # Promote current frame to be the new reference whenever a keyframe triggers
             if is_keyframe:
                 kfs_method.set_reference(frame_bgr, current_features)
 
         if is_keyframe:
-            # Downscale early to save RAM, convert OpenCV BGR -> PIL RGB, and store timestamp
+            # Measure Laplacian variance as a VLM-free sharpness indicator
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            sharpness_scores.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+
+            # Downscale early to save RAM, convert BGR -> RGB, and attach timestamp
             resized_bgr = cv2.resize(
                 frame_bgr, frame_size, interpolation=cv2.INTER_AREA
             )
@@ -135,26 +152,100 @@ def perform_kfs(
 
         frame_idx += 1
 
+    elapsed_sec = time.perf_counter() - t_start
     cap.release()
 
-    # If the KFS method triggered more frames than `max_frames`, evenly subsample
-    # across the selected keyframes while preserving strict chronological order
+    # Optional hard cap: evenly subsample while strictly preserving chronological order
     if max_frames is not None and len(sampled_video) > max_frames:
         even_indices = np.linspace(0, len(sampled_video) - 1, max_frames, dtype=int)
         sampled_video = [sampled_video[i] for i in even_indices]
+        sharpness_scores = [sharpness_scores[i] for i in even_indices]
 
-    return sampled_video
+    total_frames = max(1, frame_idx)
+    selected_count = len(sampled_video)
+    metrics = {
+        "total_frames": float(total_frames),
+        "selected_frames": float(selected_count),
+        "compression_ratio": selected_count / total_frames,
+        "avg_sharpness": float(np.mean(sharpness_scores)) if sharpness_scores else 0.0,
+        "latency_ms_per_frame": (elapsed_sec * 1000.0) / total_frames,
+    }
+
+    return sampled_video, metrics
 
 
 # =====================================================================
-# 3. SMALL VLM LOADING & INFERENCE
+# 3. TWO-STAGE MODELS: CLIP QUESTION FILTER + SMALL VLM (BLIP-VQA)
 # =====================================================================
+def load_clip_filter(model_id: str = "openai/clip-vit-base-patch32") -> Dict[str, Any]:
+    """
+    Loads OpenAI CLIP ViT-B/32 (~350 MB VRAM in FP16) to retrieve the top-K
+    question-relevant frames from the KFS keyframe pool before VLM inference.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+
+    processor = CLIPProcessor.from_pretrained(model_id)
+    model = CLIPModel.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    model.eval()
+
+    return {
+        "model": model,
+        "processor": processor,
+        "device": device,
+        "dtype": dtype,
+    }
+
+
+@torch.no_grad()
+def select_top_k_for_question(
+    clip_bundle: Dict[str, Any],
+    sampled_video: List[Dict[str, Any]],
+    question: str,
+    top_k: int = 4,
+) -> List[Dict[str, Any]]:
+    """
+    Picks the `top_k` most question-relevant frames from the KFS output pool
+    using CLIP text-image similarity, then re-sorts them chronologically.
+    Keeping `top_k=4` ensures BLIP-VQA always sees a crisp 2x2 grid.
+    """
+    if len(sampled_video) <= top_k:
+        return sampled_video
+
+    images = [item["frame"] for item in sampled_video]
+    processor = clip_bundle["processor"]
+    model = clip_bundle["model"]
+    device = clip_bundle["device"]
+    dtype = clip_bundle["dtype"]
+
+    inputs = processor(
+        text=[question],
+        images=images,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    inputs = {
+        key: (
+            val.to(device, dtype=dtype) if val.is_floating_point() else val.to(device)
+        )
+        for key, val in inputs.items()
+    }
+
+    # Compute similarity between the question and every selected keyframe
+    logits_per_image = model(**inputs).logits_per_image.squeeze(-1)
+    top_indices = torch.topk(logits_per_image, k=top_k).indices.cpu().tolist()
+
+    # Re-sort chronologically so temporal order is preserved for the VLM
+    return [sampled_video[i] for i in sorted(top_indices)]
+
+
 def load_small_vlm(model_id: str = "Salesforce/blip-vqa-base") -> Dict[str, Any]:
     """
     Loads Salesforce/blip-vqa-base (~385M params) onto GPU in FP16 (~1.1 GB VRAM),
-    making it fast and safe for a 6 GB GTX 980 Ti.
+    making it lightweight and safe for a 6 GB GTX 980 Ti alongside CLIP.
     """
-    # Use CUDA on the GTX 980 Ti if available, otherwise fall back to Ryzen CPU
+    # Use CUDA on the GTX 980 Ti if available, otherwise fall back to CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # FP16 halves VRAM usage and speeds up inference on GPU; CPU requires FP32
@@ -163,12 +254,12 @@ def load_small_vlm(model_id: str = "Salesforce/blip-vqa-base") -> Dict[str, Any]
     # BlipProcessor handles image resizing/normalization and text tokenization
     processor = BlipProcessor.from_pretrained(model_id)
 
-    # Load model weights in the target precision and move them to the GPU
+    # Load pretrained weights in target precision and transfer to GPU
     model = BlipForQuestionAnswering.from_pretrained(model_id, torch_dtype=dtype).to(
         device
     )
 
-    # Set to evaluation mode (disables dropout and gradient tracking overhead)
+    # Set to evaluation mode (disables dropout and training overhead)
     model.eval()
 
     return {
@@ -180,14 +271,14 @@ def load_small_vlm(model_id: str = "Salesforce/blip-vqa-base") -> Dict[str, Any]
 
 
 def _pack_frames_with_timestamps(
-    sampled_video: List[Dict[str, Any]],
+    keyframes: List[Dict[str, Any]],
     tile_size: Tuple[int, int] = (224, 168),
 ) -> Image.Image:
     """
     Arranges chronological {frame, timestamp} pairs into a single contact sheet
     with burned-in timestamps so a single-image VLM can reason across time.
     """
-    num_frames = max(1, len(sampled_video))
+    num_frames = max(1, len(keyframes))
     cols = math.ceil(math.sqrt(num_frames))
     rows = math.ceil(num_frames / cols)
     tile_w, tile_h = tile_size
@@ -195,7 +286,7 @@ def _pack_frames_with_timestamps(
     grid = Image.new("RGB", (cols * tile_w, rows * tile_h), color=(0, 0, 0))
     draw = ImageDraw.Draw(grid)
 
-    for idx, item in enumerate(sampled_video):
+    for idx, item in enumerate(keyframes):
         row, col = divmod(idx, cols)
         x0, y0 = col * tile_w, row * tile_h
 
@@ -212,14 +303,15 @@ def _pack_frames_with_timestamps(
 @torch.no_grad()
 def ask_vlm(
     vlm_bundle: Dict[str, Any],
-    sampled_video: List[Dict[str, Any]],
+    keyframes: List[Dict[str, Any]],
     question: str,
     options: Optional[List[str]] = None,
 ) -> str:
     """
-    Passes the KFS contact sheet and VSI-Bench question to BLIP-VQA and returns its answer.
+    Passes the chronological keyframe contact sheet and VSI-Bench question
+    to BLIP-VQA and returns the model's predicted answer string.
     """
-    visual_input = _pack_frames_with_timestamps(sampled_video)
+    visual_input = _pack_frames_with_timestamps(keyframes)
 
     if options:
         choices_str = " ".join(options)
@@ -232,7 +324,7 @@ def ask_vlm(
     device = vlm_bundle["device"]
     dtype = vlm_bundle["dtype"]
 
-    # Prepare image & text tensors and cast floating-point image tensors to FP16 on GPU
+    # Prepare image & text tensors and cast floating-point tensors to FP16 on GPU
     inputs = processor(images=visual_input, text=prompt, return_tensors="pt")
     inputs = {
         key: (
@@ -331,7 +423,7 @@ def iter_vsi_videos(
     `scannet.zip`, `scannetpp.zip`), yielding `(scene_name, local_mp4_path)`.
 
     If `target_scenes` is provided, only matching videos are extracted and
-    remaining scenes are skipped once all targets have been yielded.
+    remaining archives are skipped once all targets have been yielded.
     """
     repo_id = "nyu-visionx/VSI-Bench"
     archives = ("arkitscenes.zip", "scannet.zip", "scannetpp.zip")
@@ -380,16 +472,18 @@ def iter_vsi_videos(
 
 
 # =====================================================================
-# 6. MAIN EVALUATION PIPELINE
+# 6. MAIN TWO-STAGE EVALUATION PIPELINE
 # =====================================================================
 def main(
-    config: str = "full",
+    config: str = "debiased",
     max_videos: Optional[int] = 10,
-    max_frames: Optional[int] = 16,
+    max_kfs_frames: Optional[int] = None,
+    vlm_top_k: int = 4,
 ) -> None:
     """
-    Runs all KFS methods across VSI-Bench videos (up to `max_videos`) and
-    compares their downstream VLM accuracy.
+    Evaluates all swappable KFS methods on VSI-Bench (up to `max_videos`) using:
+      Stage 1: Question-agnostic KFS extraction + intrinsic quality metrics
+      Stage 2: CLIP Top-K question-relevant frame retrieval + BLIP-VQA scoring
     """
     # 1. Load VSI-Bench questions and group them by scene
     vsi_questions = load_vsi_bench(config=config, split="test")
@@ -407,11 +501,13 @@ def main(
         f"{len(selected_scenes)} videos."
     )
 
-    # 2. Load the lightweight VLM once onto GPU
+    # 2. Load CLIP retriever (~350 MB VRAM) and BLIP-VQA (~1.1 GB VRAM) once on GPU
+    clip_bundle = load_clip_filter("openai/clip-vit-base-patch32")
     vlm_bundle = load_small_vlm("Salesforce/blip-vqa-base")
 
-    # 3. Define the swappable KFS methods to benchmark
+    # 3. Define the swappable KFS methods to benchmark (including Uniform baseline)
     kfs_methods = [
+        UniformSamplingMethod(step=30),
         FourierMethod(threshold=0.28, blur_thresh=15.0),
         PixelIntensityMethod(threshold=25.0),
         ColorHistogramMethod(threshold=0.35, grid_size=(2, 2)),
@@ -428,8 +524,16 @@ def main(
         ),
     ]
 
-    # 4. Evaluate every scene across all KFS methods
-    stats = defaultdict(lambda: {"acc": [], "frames": []})
+    # 4. Stream through VSI-Bench scenes and evaluate every KFS method
+    stats = defaultdict(
+        lambda: {
+            "acc": [],
+            "selected_frames": [],
+            "compression_ratio": [],
+            "avg_sharpness": [],
+            "latency_ms": [],
+        }
+    )
 
     for vid_idx, (scene_name, video_path) in enumerate(
         iter_vsi_videos(target_scenes=selected_scenes, cleanup=True), start=1
@@ -441,18 +545,31 @@ def main(
         )
 
         for method in kfs_methods:
-            # Extract keyframes once per video (independent of the questions)
-            sampled_video = perform_kfs(
+            # Stage 1: Extract keyframes once per video (question-agnostic)
+            sampled_video, kfs_metrics = perform_kfs(
                 video_path=video_path,
                 kfs_method=method,
-                max_frames=max_frames,
+                max_frames=max_kfs_frames,
             )
 
-            # Reuse those exact keyframes across all questions for this scene
+            stats[method.name]["selected_frames"].append(kfs_metrics["selected_frames"])
+            stats[method.name]["compression_ratio"].append(
+                kfs_metrics["compression_ratio"]
+            )
+            stats[method.name]["avg_sharpness"].append(kfs_metrics["avg_sharpness"])
+            stats[method.name]["latency_ms"].append(kfs_metrics["latency_ms_per_frame"])
+
+            # Stage 2: Retrieve top-K frames per question via CLIP and query BLIP-VQA
             for q in scene_questions:
+                top_frames = select_top_k_for_question(
+                    clip_bundle=clip_bundle,
+                    sampled_video=sampled_video,
+                    question=q["question"],
+                    top_k=vlm_top_k,
+                )
                 vlm_answer = ask_vlm(
                     vlm_bundle=vlm_bundle,
-                    sampled_video=sampled_video,
+                    keyframes=top_frames,
                     question=q["question"],
                     options=q["options"],
                 )
@@ -462,23 +579,38 @@ def main(
                     options=q["options"],
                 )
                 stats[method.name]["acc"].append(acc)
-                stats[method.name]["frames"].append(len(sampled_video))
 
-    # 5. Print final comparison table
-    print("\n" + "=" * 72)
-    print(f"VSI-BENCH ({config.upper()}) SUMMARY — {len(selected_scenes)} VIDEOS")
-    print("=" * 72)
+    # 5. Print comprehensive comparison table (Intrinsic KFS + Downstream VLM)
+    print("\n" + "=" * 108)
+    print(
+        f"VSI-BENCH ({config.upper()}) TWO-STAGE SUMMARY — "
+        f"{len(selected_scenes)} VIDEOS (CLIP Top-{vlm_top_k} -> BLIP-VQA)"
+    )
+    print("=" * 108)
+    print(
+        f"{'KFS Method':<32} | {'Avg KFs':>7} | {'Keep %':>6} | "
+        f"{'Sharpness':>9} | {'ms/frame':>8} | {'VLM Acc':>8}"
+    )
+    print("-" * 108)
+
     for method in kfs_methods:
         s = stats[method.name]
+        avg_kfs = float(np.mean(s["selected_frames"])) if s["selected_frames"] else 0.0
+        keep_pct = (
+            float(np.mean(s["compression_ratio"])) * 100.0
+            if s["compression_ratio"]
+            else 0.0
+        )
+        sharp = float(np.mean(s["avg_sharpness"])) if s["avg_sharpness"] else 0.0
+        lat_ms = float(np.mean(s["latency_ms"])) if s["latency_ms"] else 0.0
         mean_acc = float(np.mean(s["acc"])) * 100.0 if s["acc"] else 0.0
-        mean_frames = float(np.mean(s["frames"])) if s["frames"] else 0.0
+
         print(
-            f"Method: {method.name:<32} | "
-            f"Avg Frames: {mean_frames:>4.1f} | "
-            f"Overall Accuracy: {mean_acc:>5.2f}%"
+            f"{method.name:<32} | {avg_kfs:>7.1f} | {keep_pct:>5.1f}% | "
+            f"{sharp:>9.1f} | {lat_ms:>8.2f} | {mean_acc:>7.2f}%"
         )
 
 
 if __name__ == "__main__":
-    # Set max_videos=None to run the entire dataset
-    main(config="full", max_videos=10, max_frames=16)
+    # Set max_videos=None to evaluate the entire VSI-Bench dataset
+    main(config="debiased", max_videos=1, max_kfs_frames=None, vlm_top_k=4)
