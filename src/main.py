@@ -550,10 +550,6 @@ def main(
         QuaternionFourierFusionMethod(threshold=0.36, blur_thresh=15.0, adaptive=True),
     ]
 
-    kfs_methods = [
-        QuaternionFourierFusionMethod(threshold=0.36, blur_thresh=15.0, adaptive=True),
-    ]
-
     # 4. Stream through VSI-Bench scenes and evaluate every KFS method
     stats = defaultdict(
         lambda: {
