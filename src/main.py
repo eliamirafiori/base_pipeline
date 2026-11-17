@@ -30,6 +30,7 @@ from methods import (
     LocalDescriptorMethod,
     LucasKanadeOpticalFlowMethod,
     PixelIntensityMethod,
+    QuaternionFourierFusionMethod,
 )
 
 
@@ -546,6 +547,11 @@ def main(
             blur_thresh=15.0,
             orb_thresh=0.65,
         ),
+        QuaternionFourierFusionMethod(threshold=0.36, blur_thresh=15.0, adaptive=True),
+    ]
+
+    kfs_methods = [
+        QuaternionFourierFusionMethod(threshold=0.36, blur_thresh=15.0, adaptive=True),
     ]
 
     # 4. Stream through VSI-Bench scenes and evaluate every KFS method
@@ -650,4 +656,4 @@ def main(
 
 if __name__ == "__main__":
     # Safe to run with max_kfs_frames=None on GTX 980 Ti (6 GB VRAM)
-    main(config="debiased", max_videos=None, max_kfs_frames=None, vlm_top_k=4)
+    main(config="debiased", max_videos=10, max_kfs_frames=None, vlm_top_k=4)
