@@ -18,6 +18,10 @@ from transformers import (
     BlipProcessor,
     CLIPModel,
     CLIPProcessor,
+    AutoProcessor,
+    GitForCausalLM,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
 )
 
 # Import your swappable KFS classes (no __init__.py required)
@@ -294,6 +298,41 @@ def load_small_vlm(model_id: str = "Salesforce/blip-vqa-base") -> Dict[str, Any]
     }
 
 
+# def load_small_vlm(
+#     vision_model_id: str = "Salesforce/blip-vqa-base",
+#     reasoner_model_id: str = "google/flan-t5-base",
+# ) -> Dict[str, Any]:
+#     """
+#     Loads a two-part multi-frame VQA pipeline (~2.1 GB total VRAM):
+#       1. BLIP-VQA (FP16): inspects each keyframe at full 384x384 resolution.
+#       2. Flan-T5-Base (FP32): reasons across the chronological [t=...s] observations.
+#          (Kept in FP32 to prevent T5 FP16 attention overflow.)
+#     """
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+#     vision_dtype = torch.float16 if device == "cuda" else torch.float32
+#
+#     blip_processor = BlipProcessor.from_pretrained(vision_model_id)
+#     blip_model = BlipForQuestionAnswering.from_pretrained(
+#         vision_model_id, torch_dtype=vision_dtype
+#     ).to(device)
+#     blip_model.eval()
+#
+#     t5_tokenizer = AutoTokenizer.from_pretrained(reasoner_model_id)
+#     t5_model = AutoModelForSeq2SeqLM.from_pretrained(
+#         reasoner_model_id, torch_dtype=torch.float32
+#     ).to(device)
+#     t5_model.eval()
+#
+#     return {
+#         "blip_model": blip_model,
+#         "blip_processor": blip_processor,
+#         "t5_model": t5_model,
+#         "t5_tokenizer": t5_tokenizer,
+#         "device": device,
+#         "vision_dtype": vision_dtype,
+#     }
+
+
 def _pack_frames_with_timestamps(
     keyframes: List[Dict[str, Any]],
     tile_size: Tuple[int, int] = (224, 168),
@@ -359,6 +398,74 @@ def ask_vlm(
 
     output_ids = model.generate(**inputs, max_new_tokens=12)
     return processor.decode(output_ids[0], skip_special_tokens=True).strip()
+
+
+# @torch.no_grad()
+# def ask_vlm(
+#     vlm_bundle: Dict[str, Any],
+#     keyframes: List[Dict[str, Any]],
+#     question: str,
+#     options: Optional[List[str]] = None,
+# ) -> str:
+#     """
+#     1. Queries BLIP-VQA on every retrieved keyframe at full 384x384 resolution.
+#     2. Builds a chronological [t=...s] scene log from all keyframes.
+#     3. Uses Flan-T5-Base to synthesize the timeline and answer the question.
+#     """
+#     if not keyframes:
+#         return ""
+#
+#     device = vlm_bundle["device"]
+#     vision_dtype = vlm_bundle["vision_dtype"]
+#     blip_processor = vlm_bundle["blip_processor"]
+#     blip_model = vlm_bundle["blip_model"]
+#     t5_tokenizer = vlm_bundle["t5_tokenizer"]
+#     t5_model = vlm_bundle["t5_model"]
+#
+#     # Step 1: Batched full-resolution visual probing across all K retrieved keyframes
+#     frames = [item["frame"] for item in keyframes]
+#     visual_probe = f"Question: {question} Describe what is visible in this view:"
+#     vision_inputs = blip_processor(
+#         images=frames,
+#         text=[visual_probe] * len(frames),
+#         return_tensors="pt",
+#         padding=True,
+#     )
+#     vision_inputs = {
+#         k: (v.to(device, dtype=vision_dtype) if v.is_floating_point() else v.to(device))
+#         for k, v in vision_inputs.items()
+#     }
+#
+#     obs_ids = blip_model.generate(**vision_inputs, max_new_tokens=20)
+#     observations = blip_processor.batch_decode(obs_ids, skip_special_tokens=True)
+#
+#     # Step 2: Assemble chronological timeline of observations
+#     timeline = "\n".join(
+#         f"- At t={item['timestamp']}s: {obs.strip()}"
+#         for item, obs in zip(keyframes, observations)
+#     )
+#
+#     # Step 3: Cross-frame reasoning with Flan-T5-Base
+#     if options:
+#         choices_block = "\n".join(options)
+#         reasoner_prompt = (
+#             f"Video walkthrough observations in chronological order:\n{timeline}\n\n"
+#             f"Question: {question}\n"
+#             f"Options:\n{choices_block}\n"
+#             f"Answer with only the option letter (A, B, C, or D):"
+#         )
+#     else:
+#         reasoner_prompt = (
+#             f"Video walkthrough observations in chronological order:\n{timeline}\n\n"
+#             f"Question: {question}\n"
+#             f"Answer with a single number:"
+#         )
+#
+#     t5_inputs = t5_tokenizer(
+#         reasoner_prompt, return_tensors="pt", truncation=True, max_length=512
+#     ).to(device)
+#     answer_ids = t5_model.generate(**t5_inputs, max_new_tokens=10)
+#     return t5_tokenizer.decode(answer_ids[0], skip_special_tokens=True).strip()
 
 
 # =====================================================================
@@ -528,26 +635,28 @@ def main(
 
     # 2. Load CLIP retriever (~350 MB VRAM) and BLIP-VQA (~1.1 GB VRAM) once on GPU
     clip_bundle = load_clip_filter("openai/clip-vit-base-patch32")
-    vlm_bundle = load_small_vlm("Salesforce/blip-vqa-base")
+    vlm_bundle = (
+        load_small_vlm()
+    )  # load_small_vlm(vision_model_id="Salesforce/blip-image-captioning-base")
 
     # 3. Define the swappable KFS methods to benchmark (including Uniform baseline)
     kfs_methods = [
         UniformSamplingMethod(step=30),
-        FourierMethod(threshold=0.65, blur_thresh=15.0),
-        PixelIntensityMethod(threshold=45.0),
-        ColorHistogramMethod(threshold=0.35, grid_size=(2, 2)),
-        LocalDescriptorMethod(threshold=0.70, n_features=500),
-        LucasKanadeOpticalFlowMethod(
-            threshold=85.0, max_corners=250, min_survival_ratio=0.45
-        ),
-        FarnebackOpticalFlowMethod(threshold=25.0, grid_size=(160, 120)),
+        # FourierMethod(threshold=0.65, blur_thresh=15.0),
+        # PixelIntensityMethod(threshold=45.0),
+        # ColorHistogramMethod(threshold=0.35, grid_size=(2, 2)),
+        # LocalDescriptorMethod(threshold=0.70, n_features=500),
+        # LucasKanadeOpticalFlowMethod(
+        #     threshold=85.0, max_corners=250, min_survival_ratio=0.45
+        # ),
+        # FarnebackOpticalFlowMethod(threshold=25.0, grid_size=(160, 120)),
         EgoMotionAndCascadeKFS(
-            flow_trigger_thresh=25.0,
-            static_sad_thresh=3.5,
+            flow_trigger_thresh=45,
+            static_sad_thresh=20,
             blur_thresh=15.0,
-            orb_thresh=0.65,
+            orb_thresh=0.90,
         ),
-        QuaternionFourierFusionMethod(threshold=0.36, blur_thresh=15.0, adaptive=True),
+        # QuaternionFourierFusionMethod(threshold=0.52, blur_thresh=15.0, adaptive=True),
     ]
 
     # 4. Stream through VSI-Bench scenes and evaluate every KFS method
@@ -652,4 +761,4 @@ def main(
 
 if __name__ == "__main__":
     # Safe to run with max_kfs_frames=None on GTX 980 Ti (6 GB VRAM)
-    main(config="debiased", max_videos=10, max_kfs_frames=None, vlm_top_k=4)
+    main(config="debiased", max_videos=5, max_kfs_frames=None, vlm_top_k=6)

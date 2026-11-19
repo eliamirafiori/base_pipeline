@@ -30,3 +30,17 @@ Method: Local Descriptors (ORB)          | Avg Frames: 448.1 | Overall Accuracy:
 Method: Optical Flow (Sparse LK)         | Avg Frames: 533.3 | Overall Accuracy: 13.79%
 Method: Optical Flow (Dense Farneback)   | Avg Frames: 151.0 | Overall Accuracy: 15.17%
 Method: Stacked Cascade + EgoMotion      | Avg Frames: 47.6 | Overall Accuracy: 17.24%
+
+
+### VSI-BENCH (DEBIASED) TWO-STAGE SUMMARY — 10 VIDEOS (CLIP Top-6 -> BLIP-VQA)
+
+KFS Method                       | Avg KFs | Keep % | Sharpness | ms/frame |  VLM Acc
+------------------------------------------------------------------------------------------------------------
+Uniform Baseline (step=30)       |   160.5 |   3.3% |     172.0 |     0.57 |   18.34%
+Fourier (Freq Domain)            |    37.9 |   0.9% |     163.8 |     3.96 |   15.43%
+Pixel/Intensity (Smoothed SAD)   |   388.9 |   9.0% |     160.9 |     1.02 |   15.94%
+Spatial HSV Histogram            |   540.8 |  12.5% |     133.7 |     1.70 |   16.11%
+Local Descriptors (ORB)          |   736.0 |  16.5% |     141.8 |     5.61 |   15.71%
+Optical Flow (Sparse LK)         |   573.8 |  12.8% |     137.9 |     2.38 |   16.17%
+Optical Flow (Dense Farneback)   |   326.7 |   7.3% |     148.6 |     4.21 |   14.29%
+Stacked Cascade + EgoMotion      |   313.5 |   7.0% |     153.7 |     4.86 |   15.09%
